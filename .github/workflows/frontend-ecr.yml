@@ -1,0 +1,305 @@
+name: Build and Push Frontend to ECR
+
+# 대상: frontend (단일 서비스)
+# ECR: 769413326616.dkr.ecr.ap-northeast-2.amazonaws.com/boa-frontend   ← boa- 접두사 (TF 소유 repo)
+# write-back: AWS-TEAM1-DEV/gitops 의 03_manifests/eks/frontend/frontend.yaml image: 줄
+# 브랜치: dev push 에서만 push + write-back. 그 외 ref 의 dispatch 는 build+scan 까지만.
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "src/frontend/**"
+      - ".github/workflows/frontend-ecr.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REGISTRY: 769413326616.dkr.ecr.ap-northeast-2.amazonaws.com
+  ECR_REPO: boa-frontend            # ⬅ 변경: ECR repository 이름 (boa- 접두사)
+  SERVICE_NAME: frontend            # build context / artifact 이름용 (그대로)
+  BUILD_CONTEXT: src/frontend
+  GITOPS_REPOSITORY: AWS-TEAM1-DEV/gitops   # ⬅ 변경: 새 org
+  GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH || 'dev' }}
+  GITOPS_MANIFEST: 03_manifests/eks/frontend/frontend.yaml   # ⬅ 변경: 새 gitops 경로
+
+jobs:
+  # ── 동일 sha-<40> 태그가 ECR에 이미 있는지 확인 (idempotent) ──
+  check-ecr:
+    if: ${{ github.ref == 'refs/heads/dev' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      exists: ${{ steps.lookup.outputs.exists }}
+      digest: ${{ steps.lookup.outputs.digest }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check immutable frontend tag
+        id: lookup
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tag="sha-${{ github.sha }}"
+          target="${ECR_REGISTRY}/${ECR_REPO}:${tag}"
+          error_file="${RUNNER_TEMP}/ecr-${ECR_REPO}.err"
+
+          if digest=$(aws ecr describe-images \
+            --repository-name "$ECR_REPO" \
+            --image-ids "imageTag=${tag}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>"$error_file"); then
+            [[ "$digest" == sha256:* ]] || { echo "::error::invalid digest: ${digest}"; exit 1; }
+            echo "Reusing ${target}@${digest}"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          elif grep -q 'ImageNotFoundException' "$error_file"; then
+            echo "New immutable tag: ${target}"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "digest=" >> "$GITHUB_OUTPUT"
+          else
+            cat "$error_file" >&2
+            exit 1
+          fi
+
+  # ── 빌드 + Trivy 스캔 (AWS 권한 없음) ──
+  build-and-scan:
+    needs: check-ecr
+    if: ${{ always() && (github.ref != 'refs/heads/dev' || needs.check-ecr.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
+      image_ref: ${{ steps.tags.outputs.image_ref }}
+      image_id: ${{ steps.export.outputs.image_id }}
+      push_enabled: ${{ steps.tags.outputs.push_enabled }}
+    steps:
+      - uses: actions/checkout@v6
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          PUSH_ENABLED=false
+          if [ "${{ github.ref_name }}" = "dev" ]; then PUSH_ENABLED=true; fi
+          echo "push_enabled=${PUSH_ENABLED}" >> "$GITHUB_OUTPUT"
+
+          if [ "$PUSH_ENABLED" = "true" ]; then
+            IMAGE="${ECR_REGISTRY}/${ECR_REPO}"        # ⬅ 변경: boa-frontend
+            {
+              echo "tags<<EOF"; echo "$IMAGE:sha-${{ github.sha }}"; echo "EOF"
+              echo "image_ref=$IMAGE:sha-${{ github.sha }}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            IMAGE_REF="${SERVICE_NAME}:manual-${{ github.sha }}"
+            {
+              echo "tags<<EOF"; echo "$IMAGE_REF"; echo "EOF"
+              echo "image_ref=$IMAGE_REF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reuse existing immutable ECR image
+        if: ${{ needs.check-ecr.outputs.exists == 'true' }}
+        run: echo "Build/scan/push skipped (already in ECR)."
+
+      - name: Set up Docker Buildx
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (load to local Docker, no push)
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.BUILD_CONTEXT }}/Dockerfile
+          push: false
+          load: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            SECURITY_REFRESH=${{ github.run_id }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan (fail on fixable CRITICAL/HIGH)
+        id: trivy
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.tags.outputs.image_ref }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          output: trivy-results.txt
+
+      - name: Trivy scan summary
+        if: ${{ always() && needs.check-ecr.outputs.exists != 'true' }}
+        run: |
+          if [ -f trivy-results.txt ]; then cat trivy-results.txt; fi
+
+      - name: Export scanned image to tarball
+        id: export
+        if: ${{ steps.tags.outputs.push_enabled == 'true' && needs.check-ecr.outputs.exists != 'true' }}
+        run: |
+          IMAGE_ID=$(docker image inspect "${{ steps.tags.outputs.image_ref }}" --format '{{.Id}}')
+          echo "image_id=${IMAGE_ID}" >> "$GITHUB_OUTPUT"
+          docker save -o image.tar "${{ steps.tags.outputs.image_ref }}"
+          ls -lh image.tar
+
+      - name: Upload scanned image artifact
+        if: ${{ steps.tags.outputs.push_enabled == 'true' && needs.check-ecr.outputs.exists != 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-image-${{ github.sha }}
+          path: image.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  # ── AWS OIDC → ECR Login → Push ──
+  push:
+    needs: [check-ecr, build-and-scan]
+    if: ${{ needs.build-and-scan.outputs.push_enabled == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Reuse existing immutable ECR image
+        if: ${{ needs.check-ecr.outputs.exists == 'true' }}
+        run: echo "No push required (already in ECR)."
+
+      - name: Download scanned image artifact
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: frontend-image-${{ github.sha }}
+
+      - name: Load scanned image and verify identity
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        run: |
+          docker load -i image.tar
+          LOADED_ID=$(docker image inspect "${{ needs.build-and-scan.outputs.image_ref }}" --format '{{.Id}}')
+          EXPECTED_ID="${{ needs.build-and-scan.outputs.image_id }}"
+          if [ -z "${EXPECTED_ID}" ] || [ "${LOADED_ID}" != "${EXPECTED_ID}" ]; then
+            echo "::error::loaded image id != scanned image id; refusing to push"; exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to Amazon ECR
+        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        run: |
+          set -Eeuo pipefail
+          tag="sha-${{ github.sha }}"
+          target="${ECR_REGISTRY}/${ECR_REPO}:${tag}"      # ⬅ 변경: boa-frontend
+          error_file="${RUNNER_TEMP}/ecr-race.err"
+          if docker push "$target"; then
+            echo "Published: ${target}"
+          else
+            push_status=$?
+            if digest=$(aws ecr describe-images --repository-name "$ECR_REPO" \
+              --image-ids "imageTag=${tag}" --query 'imageDetails[0].imageDigest' \
+              --output text 2>"$error_file"); then
+              [[ "$digest" == sha256:* ]] || { echo "::error::invalid digest"; exit 1; }
+              echo "::warning::tag appeared during run; reusing ${target}@${digest}"
+            else
+              cat "$error_file" >&2; exit "$push_status"
+            fi
+          fi
+
+  # ── write-back: 새 gitops 의 image: 줄 태그 교체 ──
+  update-gitops:
+    needs: [check-ecr, build-and-scan, push]
+    if: ${{ needs.build-and-scan.outputs.push_enabled == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.GITOPS_REPOSITORY }}
+          ref: ${{ env.GITOPS_BRANCH }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+          fetch-depth: 0
+
+      - name: Update GitOps frontend image tag
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+        working-directory: gitops
+        run: |
+          python - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          registry = "769413326616.dkr.ecr.ap-northeast-2.amazonaws.com"
+          image = f"{registry}/boa-frontend"                 # ⬅ 변경: boa-frontend
+          tag = os.environ["IMAGE_TAG"]
+          path = Path(os.environ["GITOPS_MANIFEST"])
+
+          if not re.fullmatch(r"sha-[0-9a-f]{40}", tag):
+              raise SystemExit(f"invalid immutable image tag: {tag}")
+
+          content = path.read_text(encoding="utf-8")
+          # Deployment 의 'image: <registry>/boa-frontend:<tag>' 한 줄만 매칭
+          pattern = re.compile(
+              rf"^([ \t]*image:[ \t]*{re.escape(image)}:)\S+([ \t]*)$",
+              re.MULTILINE,
+          )
+          content, count = pattern.subn(
+              lambda m: f"{m.group(1)}{tag}{m.group(2)}", content
+          )
+          if count != 1:
+              raise SystemExit(f"expected exactly one image line, found {count}")
+          path.write_text(content, encoding="utf-8")
+          PY
+          git diff --check
+
+      - name: Commit and push GitOps update
+        working-directory: gitops
+        run: |
+          if git diff --quiet; then
+            echo "GitOps already points to sha-${{ github.sha }}; nothing to commit."
+            exit 0
+          fi
+          git config user.name "aws-team1-cicd"
+          git config user.email "aws-team1-cicd@users.noreply.github.com"
+          git add -A
+          git commit -m "deploy(frontend): sha-${{ github.sha }}"
+
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${GITOPS_BRANCH}"; then exit 0; fi
+            if [ "$attempt" -eq 5 ]; then echo "::error::push failed after 5 attempts"; exit 1; fi
+            git fetch origin "+refs/heads/${GITOPS_BRANCH}:refs/remotes/origin/${GITOPS_BRANCH}"
+            if ! git rebase "origin/${GITOPS_BRANCH}"; then
+              git rebase --abort || true
+              echo "::error::GitOps write-back conflict"; exit 1
+            fi
+          done
