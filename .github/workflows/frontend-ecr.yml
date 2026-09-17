@@ -26,7 +26,7 @@ env:
   ECR_REPO: boa-frontend            # ⬅ 변경: ECR repository 이름 (boa- 접두사)
   SERVICE_NAME: frontend            # build context / artifact 이름용 (그대로)
   BUILD_CONTEXT: src/frontend
-  GITOPS_REPOSITORY: AWS-TEAM1-DEV/gitops   # ⬅ 변경: 새 org
+  GITOPS_REPOSITORY: AWS-TEAM1/gitops   # ⬅ 변경: 새 org
   GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH || 'dev' }}
   GITOPS_MANIFEST: 03_manifests/eks/frontend/frontend.yaml   # ⬅ 변경: 새 gitops 경로
 
