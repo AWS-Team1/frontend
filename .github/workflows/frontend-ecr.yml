@@ -1,247 +1,407 @@
 name: Build and Push Frontend to ECR
 
-# 대상: frontend (단일 서비스)
-# ECR: 769413326616.dkr.ecr.ap-northeast-2.amazonaws.com/boa-frontend   ← boa- 접두사 (TF 소유 repo)
-# write-back: AWS-TEAM1-DEV/gitops 의 03_manifests/eks/frontend/frontend.yaml image: 줄
-# 브랜치: dev push 에서만 push + write-back. 그 외 ref 의 dispatch 는 build+scan 까지만.
-
 on:
+  pull_request:
+    branches: [dev]
   push:
     branches: [dev]
-    paths:
-      - "src/frontend/**"
-      - ".github/workflows/frontend-ecr.yml"
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && 'dev-deploy' || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: false
+  queue: max
 
-permissions:
-  contents: read
+permissions: {}
 
 env:
   AWS_REGION: ap-northeast-2
   ECR_REGISTRY: 769413326616.dkr.ecr.ap-northeast-2.amazonaws.com
-  ECR_REPO: boa-frontend            # ⬅ 변경: ECR repository 이름 (boa- 접두사)
-  SERVICE_NAME: frontend            # build context / artifact 이름용 (그대로)
-  BUILD_CONTEXT: src/frontend
-  GITOPS_REPOSITORY: AWS-TEAM1-DEV/gitops   # ⬅ 변경: 새 org
-  GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH || 'dev' }}
-  GITOPS_MANIFEST: 03_manifests/eks/frontend/frontend.yaml   # ⬅ 변경: 새 gitops 경로
+  GITOPS_REPOSITORY: AWS-TEAM1-DEV/gitops
+  GITOPS_BRANCH: dev
+  GITOPS_GROUP_DIR: 03_manifests/eks/frontend
 
 jobs:
-  # ── 동일 sha-<40> 태그가 ECR에 이미 있는지 확인 (idempotent) ──
+  detect:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      services: ${{ steps.resolve.outputs.services }}
+      docker_services: ${{ steps.resolve.outputs.docker_services }}
+      deploy: ${{ steps.resolve.outputs.deploy }}
+    steps:
+      - name: Check out application source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Test Detect mapping
+        run: python .github/scripts/test_ci_detect.py
+
+      - name: Resolve service lists
+        id: resolve
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          output_file="${RUNNER_TEMP}/detect-output.txt"
+
+          case "${{ github.event_name }}" in
+            workflow_dispatch)
+              python .github/scripts/ci_detect.py --all > "$output_file"
+              ;;
+            pull_request)
+              git diff --name-status \
+                "${{ github.event.pull_request.base.sha }}" \
+                "${{ github.event.pull_request.head.sha }}" \
+                > "${RUNNER_TEMP}/changed-files.txt"
+              python .github/scripts/ci_detect.py \
+                --input "${RUNNER_TEMP}/changed-files.txt" > "$output_file"
+              ;;
+            push)
+              if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+                python .github/scripts/ci_detect.py --all > "$output_file"
+              else
+                git diff --name-status \
+                  "${{ github.event.before }}" \
+                  "${{ github.sha }}" \
+                  > "${RUNNER_TEMP}/changed-files.txt"
+                python .github/scripts/ci_detect.py \
+                  --input "${RUNNER_TEMP}/changed-files.txt" > "$output_file"
+              fi
+              ;;
+            *)
+              echo "::error::unsupported event: ${{ github.event_name }}"
+              exit 1
+              ;;
+          esac
+
+          cat "$output_file" >> "$GITHUB_OUTPUT"
+          cat "$output_file"
+          deploy=false
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/dev" ]; then
+            deploy=true
+          fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
   check-ecr:
-    if: ${{ github.ref == 'refs/heads/dev' }}
+    name: Check immutable ECR tags
+    needs: detect
+    if: >-
+      ${{
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/dev' &&
+        needs.detect.result == 'success' &&
+        needs.detect.outputs.services != '[]'
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     outputs:
-      exists: ${{ steps.lookup.outputs.exists }}
-      digest: ${{ steps.lookup.outputs.digest }}
+      existing_services: ${{ steps.lookup.outputs.existing_services }}
+      build_services: ${{ steps.lookup.outputs.build_services }}
     steps:
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Check immutable frontend tag
+      - name: Partition existing and new image tags
         id: lookup
         shell: bash
+        env:
+          SERVICES_JSON: ${{ needs.detect.outputs.services }}
+          IMAGE_TAG: sha-${{ github.sha }}
         run: |
           set -Eeuo pipefail
-          tag="sha-${{ github.sha }}"
-          target="${ECR_REGISTRY}/${ECR_REPO}:${tag}"
-          error_file="${RUNNER_TEMP}/ecr-${ECR_REPO}.err"
-
-          if digest=$(aws ecr describe-images \
-            --repository-name "$ECR_REPO" \
-            --image-ids "imageTag=${tag}" \
-            --query 'imageDetails[0].imageDigest' \
-            --output text 2>"$error_file"); then
-            [[ "$digest" == sha256:* ]] || { echo "::error::invalid digest: ${digest}"; exit 1; }
-            echo "Reusing ${target}@${digest}"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          elif grep -q 'ImageNotFoundException' "$error_file"; then
-            echo "New immutable tag: ${target}"
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "digest=" >> "$GITHUB_OUTPUT"
-          else
-            cat "$error_file" >&2
+          existing_services='[]'
+          build_services='[]'
+          while IFS= read -r service; do
+            repository="boa-${service}"
+            error_file="${RUNNER_TEMP}/ecr-${repository}.err"
+            if digest=$(aws ecr describe-images \
+              --repository-name "$repository" \
+              --image-ids "imageTag=${IMAGE_TAG}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text 2>"$error_file"); then
+              [[ "$digest" == sha256:* ]] || {
+                echo "::error::invalid digest for ${repository}:${IMAGE_TAG}: ${digest}"
+                exit 1
+              }
+              existing_services=$(jq -c --arg service "$service" '. + [$service]' <<< "$existing_services")
+              echo "Reusing ${ECR_REGISTRY}/${repository}:${IMAGE_TAG}@${digest}"
+            elif grep -q 'ImageNotFoundException' "$error_file"; then
+              build_services=$(jq -c --arg service "$service" '. + [$service]' <<< "$build_services")
+              echo "New immutable tag: ${ECR_REGISTRY}/${repository}:${IMAGE_TAG}"
+            else
+              cat "$error_file" >&2
+              exit 1
+            fi
+          done < <(jq -r '.[]' <<< "$SERVICES_JSON")
+          if ! jq -e -n \
+            --argjson services "$SERVICES_JSON" \
+            --argjson existing "$existing_services" \
+            --argjson build "$build_services" '
+              (($existing + $build) | sort) == ($services | sort) and
+              (($existing | unique | length) == ($existing | length)) and
+              (($build | unique | length) == ($build | length)) and
+              ([ $existing[] as $item | select($build | index($item) != null) ] | length == 0)
+            ' >/dev/null; then
+            echo "::error::invalid ECR partition: services=$SERVICES_JSON existing=$existing_services build=$build_services"
             exit 1
           fi
+          echo "existing_services=$existing_services" >> "$GITHUB_OUTPUT"
+          echo "build_services=$build_services" >> "$GITHUB_OUTPUT"
 
-  # ── 빌드 + Trivy 스캔 (AWS 권한 없음) ──
-  build-and-scan:
-    needs: check-ecr
-    if: ${{ always() && (github.ref != 'refs/heads/dev' || needs.check-ecr.result == 'success') }}
+  build:
+    name: Validate ${{ matrix.service }}
+    needs: [detect, check-ecr]
+    if: >-
+      ${{
+        always() &&
+        needs.detect.result == 'success' &&
+        needs.detect.outputs.services != '[]' &&
+        (needs.detect.outputs.deploy != 'true' || needs.check-ecr.result == 'success')
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    outputs:
-      tags: ${{ steps.tags.outputs.tags }}
-      image_ref: ${{ steps.tags.outputs.image_ref }}
-      image_id: ${{ steps.export.outputs.image_id }}
-      push_enabled: ${{ steps.tags.outputs.push_enabled }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.detect.outputs.services) }}
     steps:
-      - uses: actions/checkout@v6
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+      - name: Check out application source
+        uses: actions/checkout@v6
 
-      - name: Resolve image tags
-        id: tags
+      - name: Resolve service metadata
+        id: meta
+        shell: bash
         run: |
-          PUSH_ENABLED=false
-          if [ "${{ github.ref_name }}" = "dev" ]; then PUSH_ENABLED=true; fi
-          echo "push_enabled=${PUSH_ENABLED}" >> "$GITHUB_OUTPUT"
+          set -Eeuo pipefail
+          case "${{ matrix.service }}" in
+            frontend) path=src/frontend ;;
+            *) echo "::error::unknown service: ${{ matrix.service }}"; exit 1 ;;
+          esac
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "image=${ECR_REGISTRY}/boa-${{ matrix.service }}:sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
-          if [ "$PUSH_ENABLED" = "true" ]; then
-            IMAGE="${ECR_REGISTRY}/${ECR_REPO}"        # ⬅ 변경: boa-frontend
-            {
-              echo "tags<<EOF"; echo "$IMAGE:sha-${{ github.sha }}"; echo "EOF"
-              echo "image_ref=$IMAGE:sha-${{ github.sha }}"
-            } >> "$GITHUB_OUTPUT"
-          else
-            IMAGE_REF="${SERVICE_NAME}:manual-${{ github.sha }}"
-            {
-              echo "tags<<EOF"; echo "$IMAGE_REF"; echo "EOF"
-              echo "image_ref=$IMAGE_REF"
-            } >> "$GITHUB_OUTPUT"
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: ${{ steps.meta.outputs.path }}/uv.lock
+
+      - name: Install locked dependencies
+        working-directory: ${{ steps.meta.outputs.path }}
+        run: uv sync --frozen
+
+      - name: Run blocking Python lint
+        working-directory: ${{ steps.meta.outputs.path }}
+        env:
+          PYTHONPATH: .
+        run: uv run python -m pylint --errors-only --recursive=y .
+
+      - name: Decide whether Docker validation is required
+        id: docker
+        shell: bash
+        env:
+          DEPLOY: ${{ needs.detect.outputs.deploy }}
+          DOCKER_SERVICES_JSON: ${{ needs.detect.outputs.docker_services }}
+          BUILD_SERVICES_JSON: ${{ needs.check-ecr.outputs.build_services || '[]' }}
+        run: |
+          set -Eeuo pipefail
+          required=false
+          if [ "$DEPLOY" = "true" ]; then
+            if jq -e --arg service "${{ matrix.service }}" 'index($service) != null' <<< "$BUILD_SERVICES_JSON" >/dev/null; then
+              required=true
+            fi
+          elif jq -e --arg service "${{ matrix.service }}" 'index($service) != null' <<< "$DOCKER_SERVICES_JSON" >/dev/null; then
+            required=true
           fi
+          echo "required=$required" >> "$GITHUB_OUTPUT"
 
-      - name: Reuse existing immutable ECR image
-        if: ${{ needs.check-ecr.outputs.exists == 'true' }}
-        run: echo "Build/scan/push skipped (already in ECR)."
+      - name: Reuse existing immutable image
+        if: ${{ needs.detect.outputs.deploy == 'true' && steps.docker.outputs.required != 'true' }}
+        run: echo "Docker/Trivy/Push reuse for ${{ matrix.service }}; Test/Lint still ran."
 
       - name: Set up Docker Buildx
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        if: ${{ steps.docker.outputs.required == 'true' }}
         uses: docker/setup-buildx-action@v4
 
-      - name: Build image (load to local Docker, no push)
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+      - name: Build image once
+        if: ${{ steps.docker.outputs.required == 'true' }}
         uses: docker/build-push-action@v7
         with:
-          context: ${{ env.BUILD_CONTEXT }}
-          file: ${{ env.BUILD_CONTEXT }}/Dockerfile
+          context: ${{ steps.meta.outputs.path }}
+          file: ${{ steps.meta.outputs.path }}/Dockerfile
           push: false
-          load: true
           provenance: false
-          tags: ${{ steps.tags.outputs.tags }}
-          build-args: |
-            SECURITY_REFRESH=${{ github.run_id }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.image }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+          cache-from: type=gha,scope=frontend-${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=frontend-${{ matrix.service }}
 
-      - name: Trivy image scan (fail on fixable CRITICAL/HIGH)
-        id: trivy
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+      - name: Record built Docker image ID
+        if: ${{ steps.docker.outputs.required == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker load -i "${RUNNER_TEMP}/image.tar"
+          image_id=$(docker image inspect '${{ steps.meta.outputs.image }}' --format '{{.Id}}')
+          [[ "$image_id" == sha256:* ]] || { echo "::error::invalid image ID: $image_id"; exit 1; }
+          printf '%s\n' "$image_id" > "${RUNNER_TEMP}/image-id.txt"
+          echo "Built image ID: $image_id"
+
+      - name: Scan the built image with Trivy
+        if: ${{ steps.docker.outputs.required == 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          scan-type: image
-          image-ref: ${{ steps.tags.outputs.image_ref }}
+          input: ${{ runner.temp }}/image.tar
           format: table
-          severity: CRITICAL,HIGH
+          severity: HIGH,CRITICAL
           exit-code: '1'
           ignore-unfixed: true
-          vuln-type: os,library
-          output: trivy-results.txt
 
-      - name: Trivy scan summary
-        if: ${{ always() && needs.check-ecr.outputs.exists != 'true' }}
-        run: |
-          if [ -f trivy-results.txt ]; then cat trivy-results.txt; fi
-
-      - name: Export scanned image to tarball
-        id: export
-        if: ${{ steps.tags.outputs.push_enabled == 'true' && needs.check-ecr.outputs.exists != 'true' }}
-        run: |
-          IMAGE_ID=$(docker image inspect "${{ steps.tags.outputs.image_ref }}" --format '{{.Id}}')
-          echo "image_id=${IMAGE_ID}" >> "$GITHUB_OUTPUT"
-          docker save -o image.tar "${{ steps.tags.outputs.image_ref }}"
-          ls -lh image.tar
-
-      - name: Upload scanned image artifact
-        if: ${{ steps.tags.outputs.push_enabled == 'true' && needs.check-ecr.outputs.exists != 'true' }}
+      - name: Upload the scanned image artifact
+        if: ${{ needs.detect.outputs.deploy == 'true' && steps.docker.outputs.required == 'true' }}
         uses: actions/upload-artifact@v7
         with:
-          name: frontend-image-${{ github.sha }}
-          path: image.tar
+          name: image-${{ matrix.service }}
+          path: |
+            ${{ runner.temp }}/image.tar
+            ${{ runner.temp }}/image-id.txt
           retention-days: 1
           if-no-files-found: error
 
-  # ── AWS OIDC → ECR Login → Push ──
   push:
-    needs: [check-ecr, build-and-scan]
-    if: ${{ needs.build-and-scan.outputs.push_enabled == 'true' }}
+    name: Publish ${{ matrix.service }}
+    needs: [detect, check-ecr, build]
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/dev' &&
+        needs.detect.result == 'success' &&
+        needs.check-ecr.result == 'success' &&
+        needs.build.result == 'success' &&
+        needs.detect.outputs.services != '[]'
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.detect.outputs.services) }}
     steps:
       - name: Reuse existing immutable ECR image
-        if: ${{ needs.check-ecr.outputs.exists == 'true' }}
-        run: echo "No push required (already in ECR)."
+        if: ${{ contains(fromJSON(needs.check-ecr.outputs.existing_services), matrix.service) }}
+        run: echo "No push required for ${{ matrix.service }}; its immutable SHA tag already exists."
 
       - name: Download scanned image artifact
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        if: ${{ contains(fromJSON(needs.check-ecr.outputs.build_services), matrix.service) }}
         uses: actions/download-artifact@v7
         with:
-          name: frontend-image-${{ github.sha }}
+          name: image-${{ matrix.service }}
+          path: ${{ runner.temp }}
 
-      - name: Load scanned image and verify identity
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+      - name: Load and verify the scanned image artifact
+        if: ${{ contains(fromJSON(needs.check-ecr.outputs.build_services), matrix.service) }}
+        shell: bash
+        env:
+          TARGET_IMAGE: ${{ env.ECR_REGISTRY }}/boa-${{ matrix.service }}:sha-${{ github.sha }}
         run: |
-          docker load -i image.tar
-          LOADED_ID=$(docker image inspect "${{ needs.build-and-scan.outputs.image_ref }}" --format '{{.Id}}')
-          EXPECTED_ID="${{ needs.build-and-scan.outputs.image_id }}"
-          if [ -z "${EXPECTED_ID}" ] || [ "${LOADED_ID}" != "${EXPECTED_ID}" ]; then
-            echo "::error::loaded image id != scanned image id; refusing to push"; exit 1
-          fi
+          set -Eeuo pipefail
+          expected_id=$(tr -d '\r\n' < "${RUNNER_TEMP}/image-id.txt")
+          docker load -i "${RUNNER_TEMP}/image.tar"
+          loaded_id=$(docker image inspect "$TARGET_IMAGE" --format '{{.Id}}')
+          [ "$loaded_id" = "$expected_id" ] || {
+            echo "::error::artifact image ID mismatch: built=${expected_id}, loaded=${loaded_id}"
+            exit 1
+          }
+          echo "Verified scanned image ID: $loaded_id"
 
-      - name: Configure AWS credentials (OIDC)
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+      - name: Configure AWS credentials
+        if: ${{ contains(fromJSON(needs.check-ecr.outputs.build_services), matrix.service) }}
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+        if: ${{ contains(fromJSON(needs.check-ecr.outputs.build_services), matrix.service) }}
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Push image to Amazon ECR
-        if: ${{ needs.check-ecr.outputs.exists != 'true' }}
+      - name: Recheck and push the scanned image
+        if: ${{ contains(fromJSON(needs.check-ecr.outputs.build_services), matrix.service) }}
+        shell: bash
+        env:
+          REPOSITORY: boa-${{ matrix.service }}
+          IMAGE_TAG: sha-${{ github.sha }}
         run: |
           set -Eeuo pipefail
-          tag="sha-${{ github.sha }}"
-          target="${ECR_REGISTRY}/${ECR_REPO}:${tag}"      # ⬅ 변경: boa-frontend
-          error_file="${RUNNER_TEMP}/ecr-race.err"
+          target="${ECR_REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          error_file="${RUNNER_TEMP}/ecr-recheck-${REPOSITORY}.err"
+          if digest=$(aws ecr describe-images \
+            --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=${IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>"$error_file"); then
+            [[ "$digest" == sha256:* ]] || { echo "::error::invalid digest: $digest"; exit 1; }
+            echo "Tag appeared during this run; reusing ${target}@${digest}"
+            exit 0
+          elif ! grep -q 'ImageNotFoundException' "$error_file"; then
+            cat "$error_file" >&2
+            exit 1
+          fi
           if docker push "$target"; then
-            echo "Published: ${target}"
+            echo "Published: $target"
+            exit 0
           else
             push_status=$?
-            if digest=$(aws ecr describe-images --repository-name "$ECR_REPO" \
-              --image-ids "imageTag=${tag}" --query 'imageDetails[0].imageDigest' \
-              --output text 2>"$error_file"); then
-              [[ "$digest" == sha256:* ]] || { echo "::error::invalid digest"; exit 1; }
-              echo "::warning::tag appeared during run; reusing ${target}@${digest}"
-            else
-              cat "$error_file" >&2; exit "$push_status"
-            fi
+          fi
+          if digest=$(aws ecr describe-images \
+            --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=${IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>"$error_file"); then
+            [[ "$digest" == sha256:* ]] || { echo "::error::invalid digest after push race"; exit 1; }
+            echo "::warning::another run created ${target}@${digest}; reusing it"
+          else
+            cat "$error_file" >&2
+            exit "$push_status"
           fi
 
-  # ── write-back: 새 gitops 의 image: 줄 태그 교체 ──
   update-gitops:
-    needs: [check-ecr, build-and-scan, push]
-    if: ${{ needs.build-and-scan.outputs.push_enabled == 'true' }}
+    name: Update GitOps image references
+    needs: [detect, check-ecr, build, push]
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/dev' &&
+        needs.detect.result == 'success' &&
+        needs.check-ecr.result == 'success' &&
+        needs.build.result == 'success' &&
+        needs.push.result == 'success' &&
+        needs.detect.outputs.services != '[]'
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Checkout GitOps repository
+      - name: Check out GitOps repository
         uses: actions/checkout@v6
         with:
           repository: ${{ env.GITOPS_REPOSITORY }}
@@ -250,56 +410,203 @@ jobs:
           path: gitops
           fetch-depth: 0
 
-      - name: Update GitOps frontend image tag
-        env:
-          IMAGE_TAG: sha-${{ github.sha }}
+      - name: Update only the mapped container images
         working-directory: gitops
+        env:
+          SERVICES_JSON: ${{ needs.detect.outputs.services }}
+          IMAGE_TAG: sha-${{ github.sha }}
+          GROUP_DIR: ${{ env.GITOPS_GROUP_DIR }}
+          CHANGED_LIST: ${{ runner.temp }}/gitops-changed-files.txt
+        shell: bash
         run: |
+          set -Eeuo pipefail
           python - <<'PY'
-          import os, re
+          import json
+          import os
+          import re
+          import subprocess
           from pathlib import Path
 
           registry = "769413326616.dkr.ecr.ap-northeast-2.amazonaws.com"
-          image = f"{registry}/boa-frontend"                 # ⬅ 변경: boa-frontend
+          allowed = {"frontend"}
+          services = json.loads(os.environ["SERVICES_JSON"])
           tag = os.environ["IMAGE_TAG"]
-          path = Path(os.environ["GITOPS_MANIFEST"])
-
+          group_dir = Path(os.environ["GROUP_DIR"])
+          changed_list = Path(os.environ["CHANGED_LIST"])
+          if services != sorted(set(services)) or not services or any(s not in allowed for s in services):
+              raise SystemExit(f"invalid canonical service list: {services}")
           if not re.fullmatch(r"sha-[0-9a-f]{40}", tag):
-              raise SystemExit(f"invalid immutable image tag: {tag}")
+              raise SystemExit(f"invalid immutable tag: {tag}")
 
-          content = path.read_text(encoding="utf-8")
-          # Deployment 의 'image: <registry>/boa-frontend:<tag>' 한 줄만 매칭
-          pattern = re.compile(
-              rf"^([ \t]*image:[ \t]*{re.escape(image)}:)\S+([ \t]*)$",
-              re.MULTILINE,
+          expected_changed: list[str] = []
+          for service in services:
+              path = group_dir / f"{service}.yaml"
+              if not path.is_file():
+                  raise SystemExit(f"mapped GitOps manifest not found: {path}")
+              image = f"{registry}/boa-{service}:{tag}"
+              content = path.read_text(encoding="utf-8")
+              pattern = re.compile(
+                  rf"(?m)^(\s*-\s+name:\s*{re.escape(service)}\s*\n\s+image:\s*)\S+(\s*)$"
+              )
+              updated, count = pattern.subn(lambda m: f"{m.group(1)}{image}{m.group(2)}", content)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one mapped container for {service}, found {count}")
+              if updated != content:
+                  path.write_text(updated, encoding="utf-8")
+                  expected_changed.append(path.as_posix())
+
+          actual_changed = sorted(
+              line for line in subprocess.check_output(
+                  ["git", "diff", "--name-only"], text=True
+              ).splitlines() if line
           )
-          content, count = pattern.subn(
-              lambda m: f"{m.group(1)}{tag}{m.group(2)}", content
-          )
-          if count != 1:
-              raise SystemExit(f"expected exactly one image line, found {count}")
-          path.write_text(content, encoding="utf-8")
+          expected_changed.sort()
+          if actual_changed != expected_changed:
+              raise SystemExit(
+                  f"unexpected GitOps file set: expected={expected_changed}, actual={actual_changed}"
+              )
+          changed_list.write_text("".join(f"{path}\n" for path in expected_changed), encoding="utf-8")
           PY
           git diff --check
 
       - name: Commit and push GitOps update
         working-directory: gitops
+        env:
+          CHANGED_LIST: ${{ runner.temp }}/gitops-changed-files.txt
+        shell: bash
         run: |
-          if git diff --quiet; then
-            echo "GitOps already points to sha-${{ github.sha }}; nothing to commit."
+          set -Eeuo pipefail
+          if [ ! -s "$CHANGED_LIST" ]; then
+            echo "GitOps references already point to sha-${{ github.sha }}."
             exit 0
           fi
           git config user.name "aws-team1-cicd"
           git config user.email "aws-team1-cicd@users.noreply.github.com"
-          git add -A
+          while IFS= read -r path; do git add -- "$path"; done < "$CHANGED_LIST"
           git commit -m "deploy(frontend): sha-${{ github.sha }}"
-
           for attempt in 1 2 3 4 5; do
             if git push origin "HEAD:${GITOPS_BRANCH}"; then exit 0; fi
-            if [ "$attempt" -eq 5 ]; then echo "::error::push failed after 5 attempts"; exit 1; fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::GitOps push failed after 5 attempts"
+              exit 1
+            fi
             git fetch origin "+refs/heads/${GITOPS_BRANCH}:refs/remotes/origin/${GITOPS_BRANCH}"
             if ! git rebase "origin/${GITOPS_BRANCH}"; then
               git rebase --abort || true
-              echo "::error::GitOps write-back conflict"; exit 1
+              echo "::error::GitOps write-back conflict"
+              exit 1
             fi
           done
+
+  ci-required:
+    name: Frontend CI Required
+    needs: [detect, build]
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Evaluate PR validation contract
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          SERVICES_JSON: ${{ needs.detect.outputs.services }}
+          DOCKER_SERVICES_JSON: ${{ needs.detect.outputs.docker_services }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          allowed = {"frontend"}
+          if os.environ["DETECT_RESULT"] != "success":
+              raise SystemExit(f"Detect did not succeed: {os.environ['DETECT_RESULT']}")
+          try:
+              services = json.loads(os.environ["SERVICES_JSON"])
+              docker_services = json.loads(os.environ["DOCKER_SERVICES_JSON"])
+          except json.JSONDecodeError as error:
+              raise SystemExit(f"invalid Detect JSON: {error}") from error
+          for name, values in (("services", services), ("docker_services", docker_services)):
+              if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+                  raise SystemExit(f"{name} must be a JSON string array: {values!r}")
+              if values != sorted(set(values)) or any(v not in allowed for v in values):
+                  raise SystemExit(f"invalid canonical {name}: {values}")
+          if not set(docker_services).issubset(services):
+              raise SystemExit("docker_services must be a subset of services")
+          expected = "skipped" if not services else "success"
+          if os.environ["BUILD_RESULT"] != expected:
+              raise SystemExit(
+                  f"invalid PR result: services={services}, build={os.environ['BUILD_RESULT']}, expected={expected}"
+              )
+          print("PR CI contract passed")
+          PY
+
+  dev-summary:
+    name: Dev Pipeline Summary
+    needs: [detect, check-ecr, build, push, update-gitops]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Evaluate dev deployment contract
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          CHECK_ECR_RESULT: ${{ needs.check-ecr.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUSH_RESULT: ${{ needs.push.result }}
+          GITOPS_RESULT: ${{ needs.update-gitops.result }}
+          SERVICES_JSON: ${{ needs.detect.outputs.services }}
+          EXISTING_SERVICES_JSON: ${{ needs.check-ecr.outputs.existing_services }}
+          BUILD_SERVICES_JSON: ${{ needs.check-ecr.outputs.build_services }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          if os.environ["DETECT_RESULT"] != "success":
+              raise SystemExit(f"Detect failed: {os.environ['DETECT_RESULT']}")
+          try:
+              services = json.loads(os.environ["SERVICES_JSON"])
+          except json.JSONDecodeError as error:
+              raise SystemExit(f"invalid services JSON: {error}") from error
+          allowed = {"frontend"}
+          if not isinstance(services, list) or any(not isinstance(v, str) for v in services):
+              raise SystemExit(f"services must be a JSON string array: {services!r}")
+          if services != sorted(set(services)) or any(v not in allowed for v in services):
+              raise SystemExit(f"invalid canonical services: {services}")
+          results = {
+              "check-ecr": os.environ["CHECK_ECR_RESULT"],
+              "build": os.environ["BUILD_RESULT"],
+              "push": os.environ["PUSH_RESULT"],
+              "update-gitops": os.environ["GITOPS_RESULT"],
+          }
+          if not services:
+              if any(result != "skipped" for result in results.values()):
+                  raise SystemExit(f"invalid no-service result combination: {results}")
+              print("No affected services; dev pipeline passed")
+              raise SystemExit(0)
+          try:
+              existing_services = json.loads(os.environ["EXISTING_SERVICES_JSON"])
+              build_services = json.loads(os.environ["BUILD_SERVICES_JSON"])
+          except json.JSONDecodeError as error:
+              raise SystemExit(f"invalid ECR partition JSON: {error}") from error
+          for name, values in (("existing_services", existing_services), ("build_services", build_services)):
+              if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+                  raise SystemExit(f"{name} must be a JSON string array: {values!r}")
+              if values != sorted(set(values)) or any(v not in allowed for v in values):
+                  raise SystemExit(f"invalid canonical {name}: {values}")
+          if set(existing_services) & set(build_services):
+              raise SystemExit("existing_services and build_services overlap")
+          if set(existing_services) | set(build_services) != set(services):
+              raise SystemExit("ECR partition does not cover services")
+          for job in ("check-ecr", "build", "update-gitops"):
+              if results[job] != "success":
+                  raise SystemExit(f"{job} did not succeed: {results[job]}")
+          if build_services and results["push"] != "success":
+              raise SystemExit(f"new images required but push={results['push']}")
+          if not build_services and results["push"] not in {"success", "skipped"}:
+              raise SystemExit(f"invalid existing-image push result: {results['push']}")
+          print(f"Dev pipeline contract passed: {results}")
+          PY
