@@ -16,10 +16,12 @@
 # Digest pinned to the current python:3.14.6-slim (Debian 13.6, trixie), which already
 # ships the Debian security updates for util-linux (CVE-2026-53612/53613/53614) and
 # openssl (CVE-2026-14456). Refresh this digest when a newer 3.14.x-slim is published.
-FROM python:3.14.6-slim@sha256:7bec7ddcddeff7975d6ba9b4be7dd6f6b2f55e7491539145e2978f7f97ce9144 AS base
+FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS base
 # uv pinned to an explicit version + digest (was the mutable ':latest' tag) so the
 # builder toolchain is reproducible and not silently updated on every CI run.
 COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 /uv /bin/uv
+# uv로 가상환경을 구성하므로 취약한 패키지를 포함한 시스템 pip는 제거
+RUN python -m pip uninstall -y pip
 
 FROM base AS builder
 
@@ -37,11 +39,12 @@ FROM base
 # perl-base carries CVE-2026-13221 / CVE-2026-8376 / CVE-2026-42496 (CRITICAL, Debian
 # "no-dsa"/deferred in trixie) plus 5 HIGH, and nothing in the runtime image (gunicorn +
 # the frontend Flask app) uses perl, so removing it eliminates those 8 findings outright.
+ARG SECURITY_REFRESH=manual
+
 RUN set -eux; \
+    echo "security refresh: ${SECURITY_REFRESH}"; \
     apt-get update; \
     apt-get upgrade -y; \
-    apt-get purge -y --allow-remove-essential perl-base; \
-    apt-get autoremove -y --purge; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
