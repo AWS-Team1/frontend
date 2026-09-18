@@ -16,7 +16,7 @@
 # Digest pinned to the current python:3.14.6-slim (Debian 13.6, trixie), which already
 # ships the Debian security updates for util-linux (CVE-2026-53612/53613/53614) and
 # openssl (CVE-2026-14456). Refresh this digest when a newer 3.14.x-slim is published.
-FROM python:3.14.6-slim@sha256:7bec7ddcddeff7975d6ba9b4be7dd6f6b2f55e7491539145e2978f7f97ce9144 AS base
+FROM python:3.14.7-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS base
 # uv pinned to an explicit version + digest (was the mutable ':latest' tag) so the
 # builder toolchain is reproducible and not silently updated on every CI run.
 COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 /uv /bin/uv
