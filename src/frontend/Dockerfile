@@ -13,9 +13,8 @@
 # limitations under the License.
 
 # Use the official Python docker container, slim version, running Debian.
-# Digest pinned to the current python:3.14.6-slim (Debian 13.6, trixie), which already
-# ships the Debian security updates for util-linux (CVE-2026-53612/53613/53614) and
-# openssl (CVE-2026-14456). Refresh this digest when a newer 3.14.x-slim is published.
+# Pin Python 3.14.7 to Debian 12 (bookworm) for a reproducible runtime base.
+# Refresh the digest only after the replacement image passes the same Trivy gate.
 FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS base
 # uv pinned to an explicit version + digest (was the mutable ':latest' tag) so the
 # builder toolchain is reproducible and not silently updated on every CI run.
@@ -34,11 +33,8 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 FROM base
 
-# Apply outstanding Debian security updates on every build (defense in depth: picks up
-# point-release fixes published after the base digest above was cut), and drop perl-base.
-# perl-base carries CVE-2026-13221 / CVE-2026-8376 / CVE-2026-42496 (CRITICAL, Debian
-# "no-dsa"/deferred in trixie) plus 5 HIGH, and nothing in the runtime image (gunicorn +
-# the frontend Flask app) uses perl, so removing it eliminates those 8 findings outright.
+# Apply outstanding Debian security updates on every build. SECURITY_REFRESH is
+# supplied by CI so BuildKit cannot reuse a stale apt upgrade layer.
 ARG SECURITY_REFRESH=manual
 
 RUN set -eux; \
