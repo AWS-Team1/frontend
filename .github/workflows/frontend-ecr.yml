@@ -264,6 +264,16 @@ jobs:
           printf '%s\n' "$image_id" > "${RUNNER_TEMP}/image-id.txt"
           echo "Built image ID: $image_id"
 
+      - name: Smoke-test Gunicorn in the built image
+        if: ${{ steps.docker.outputs.required == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker run --rm \
+            --entrypoint /app/.venv/bin/gunicorn \
+            '${{ steps.meta.outputs.image }}' \
+            --version
+
       - name: Scan the built image with Trivy
         if: ${{ steps.docker.outputs.required == 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
