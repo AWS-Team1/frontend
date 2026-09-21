@@ -1,7 +1,9 @@
       <!-- Page Footer -->
       <footer class="footer">
         <div class="container">
-            <div class="row mb-2">Bank App · AWS EKS demo</div>
+            <div class="row mb-2">
+              Bank App · {{ platform_display_name or 'Cloud' }}{% if platform == 'aws' %} EKS{% elif platform == 'gcp' %} GKE{% endif %} demo
+            </div>
             <div class="row mb-3">
               <small>
                 <b>Cluster: </b>{{ cluster_name }}, <b>Pod: </b>{{ pod_name }},
@@ -10,8 +12,8 @@
             </div>
             <div class="row mb-3">
               <small>
-                This application runs on AWS for demonstration purposes only.
-                It is not an actual bank or an official AWS service.
+                This application runs on {{ platform_display_name or 'the configured platform' }} for demonstration purposes only.
+                It is not an actual bank or an official {{ platform_display_name or 'cloud provider' }} service.
               </small>
             </div>
         </div>
