@@ -29,10 +29,8 @@ from time import sleep
 import requests
 from requests.exceptions import HTTPError, RequestException
 import jwt
-import redis
-from redis.exceptions import RedisError
 from flask import Flask, abort, jsonify, make_response, redirect, \
-    render_template, request, url_for
+    render_template, request, url_for, g
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -46,6 +44,7 @@ from opentelemetry.instrumentation.jinja2 import Jinja2Instrumentor
 
 # Local imports
 from api_call import ApiCall, ApiRequest
+from session_store import SessionStore, SessionStoreUnavailable, create_valkey_client
 from traced_thread_pool_executor import TracedThreadPoolExecutor
 
 # Local constants
@@ -60,24 +59,108 @@ def create_app():
     of the Frontend Flask App
     """
     app = Flask(__name__)
-
-    # Optional Redis-backed session registry. When configured, each login
-    # records a session keyed by the token's jti so it can be revoked (e.g.
-    # immediate logout) server-side. When REDIS_URL is unset or Redis is
-    # unavailable we fall back to stateless JWT signature verification.
-    redis_client = None
-    redis_url = os.environ.get('REDIS_URL')
-    if redis_url:
-        redis_client = redis.Redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2,
-        )
+    session_store = SessionStore(
+        create_valkey_client(),
+        idle_ttl=int(os.getenv('SESSION_IDLE_TTL_SECONDS', '300')),
+        absolute_ttl=int(os.getenv('SESSION_ABSOLUTE_TTL_SECONDS', '3600')),
+        max_sessions=int(os.getenv('SESSION_MAX_PER_USER', '3')),
+    )
 
     # Disabling unused-variable for lines with route decorated functions
     # as pylint thinks they are unused
     # pylint: disable=unused-variable
+
+    @app.errorhandler(SessionStoreUnavailable)
+    def session_store_unavailable(err):
+        app.logger.error('Security session store unavailable: %s', str(err))
+        return 'authentication service temporarily unavailable', 503
+
+    def _refresh_access_token(session_id, session):
+        try:
+            response = requests.post(
+                url=app.config['REFRESH_URI'],
+                headers={'Authorization': 'Bearer ' + session['refresh_token']},
+                timeout=app.config['BACKEND_TIMEOUT'],
+            )
+            if response.status_code == 401:
+                return None
+            response.raise_for_status()
+            access_token = response.json()['access_token']
+            claims = jwt.decode(
+                jwt=access_token,
+                key=app.config['PUBLIC_KEY'],
+                algorithms=['RS256'],
+            )
+            if claims.get('token_type') != 'access':
+                raise jwt.InvalidTokenError('wrong token type')
+            if not session_store.update_access_token(session_id, access_token):
+                return None
+            session['access_token'] = access_token
+            return claims
+        except (RequestException, KeyError, ValueError) as err:
+            raise SessionStoreUnavailable(
+                'Unable to refresh internal access token') from err
+        except jwt.InvalidTokenError:
+            return None
+
+    def _load_authentication():
+        if getattr(g, 'authentication_loaded', False):
+            return getattr(g, 'authentication', None)
+        g.authentication_loaded = True
+        g.authentication = None
+        session_id = request.cookies.get(app.config['SESSION_COOKIE'])
+        session = session_store.get(session_id)
+        if session is None:
+            return None
+        try:
+            claims = jwt.decode(
+                jwt=session['access_token'],
+                key=app.config['PUBLIC_KEY'],
+                algorithms=['RS256'],
+                options={'verify_exp': False},
+            )
+            if claims.get('token_type') != 'access':
+                raise jwt.InvalidTokenError('wrong token type')
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            if claims['exp'] - now <= app.config['TOKEN_REFRESH_WINDOW_SECONDS']:
+                claims = _refresh_access_token(session_id, session)
+                if claims is None:
+                    session_store.revoke(session_id, session.get('user'))
+                    return None
+            else:
+                jwt.decode(
+                    jwt=session['access_token'],
+                    key=app.config['PUBLIC_KEY'],
+                    algorithms=['RS256'],
+                )
+            g.authentication = (session, session['access_token'], claims)
+            return g.authentication
+        except (jwt.InvalidTokenError, KeyError, TypeError):
+            session_store.revoke(session_id, session.get('user'))
+            return None
+
+    def _access_token():
+        authentication = _load_authentication()
+        return authentication[1] if authentication else None
+
+    def _csrf_token():
+        return request.cookies.get(app.config['CSRF_COOKIE'])
+
+    @app.before_request
+    def validate_csrf():
+        protected_routes = {'payment', 'deposit', 'consent', 'logout'}
+        if request.method != 'POST' or request.endpoint not in protected_routes:
+            return None
+        authentication = _load_authentication()
+        if authentication is None:
+            return abort(401)
+        session = authentication[0]
+        submitted = request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
+        if not session_store.verify_csrf(session, submitted, _csrf_token()):
+            app.logger.warning('CSRF validation failed for %s', request.endpoint)
+            return abort(403)
+        return None
+
     @app.route('/version', methods=['GET'])
     def version():
         """
@@ -90,6 +173,7 @@ def create_app():
         """
         Readiness probe
         """
+        session_store.ping()
         return 'ok', 200
 
     @app.route('/whereami', methods=['GET'])
@@ -106,7 +190,7 @@ def create_app():
         """
         Renders home page or login page, depending on authentication status.
         """
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         if not verify_token(token):
             return login_page()
         return home()
@@ -116,7 +200,7 @@ def create_app():
         """
         Renders home page. Redirects to /login if token is not valid
         """
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         if not verify_token(token):
             # user isn't authenticated
             app.logger.debug('User isn\'t authenticated. Redirecting to login page.')
@@ -186,7 +270,8 @@ def create_app():
                                platform=platform,
                                platform_display_name=platform_display_name,
                                pod_name=pod_name,
-                               pod_zone=pod_zone)
+                               pod_zone=pod_zone,
+                               csrf_token=_csrf_token())
 
     def _populate_contact_labels(account_id, transactions, contacts):
         """
@@ -228,7 +313,7 @@ def create_app():
         - basic validation checks fail
         - response code from ledgerwriter is not 201
         """
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         if not verify_token(token):
             # user isn't authenticated
             app.logger.error('Error submitting payment: user is not authenticated.')
@@ -290,7 +375,7 @@ def create_app():
         - routing number == local routing number
         - response code from ledgerwriter is not 201
         """
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         if not verify_token(token):
             # user isn't authenticated
             app.logger.error('Error submitting deposit: user is not authenticated.')
@@ -346,7 +431,7 @@ def create_app():
 
     def _submit_transaction(transaction_data):
         app.logger.debug('Submitting transaction.')
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         hed = {'Authorization': 'Bearer ' + token,
                'content-type': 'application/json'}
         resp = requests.post(url=app.config["TRANSACTIONS_URI"],
@@ -368,7 +453,7 @@ def create_app():
         Raise: UserWarning  if the response status is 4xx or 5xx.
         """
         app.logger.debug('Adding new contact.')
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         hed = {'Authorization': 'Bearer ' + token,
                'content-type': 'application/json'}
         contact_data = {
@@ -394,7 +479,7 @@ def create_app():
         Renders login page. Redirects to /home if user already has a valid token.
         If this is an oauth flow, then redirect to a consent form.
         """
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         response_type = request.args.get('response_type')
         client_id = request.args.get('client_id')
         app_name = request.args.get('app_name')
@@ -460,15 +545,23 @@ def create_app():
     def _login_helper(username, password, request_args):
         try:
             app.logger.debug('Logging in.')
-            req = requests.get(url=app.config["LOGIN_URI"],
-                               params={'username': username, 'password': password},
-                               timeout=app.config['BACKEND_TIMEOUT']*2)
+            req = requests.post(url=app.config["LOGIN_URI"],
+                                data={'username': username, 'password': password},
+                                timeout=app.config['BACKEND_TIMEOUT']*2)
             req.raise_for_status()  # Raise on HTTP Status code 4XX or 5XX
 
             # login success
-            token = req.json()['token']
-            claims = decode_token(token)
-            max_age = claims['exp'] - claims['iat']
+            token = req.json()['access_token']
+            refresh_token = req.json()['refresh_token']
+            claims = jwt.decode(
+                jwt=token,
+                key=app.config['PUBLIC_KEY'],
+                algorithms=['RS256'],
+            )
+            if claims.get('token_type') != 'access':
+                raise jwt.InvalidTokenError('wrong token type')
+            session_id, csrf_token = session_store.create(
+                token, refresh_token, claims)
 
             if ('response_type' in request_args and
                 'state' in request_args and
@@ -484,11 +577,28 @@ def create_app():
                 resp = make_response(redirect(url_for('home',
                                                       _external=True,
                                                       _scheme=app.config['SCHEME'])))
-            resp.set_cookie(app.config['TOKEN_NAME'], token, max_age=max_age)
-            _register_session(token, max_age)
+            cookie_options = {
+                'max_age': app.config['SESSION_ABSOLUTE_TTL_SECONDS'],
+                'secure': app.config['COOKIE_SECURE'],
+                'samesite': 'Strict',
+                'path': '/',
+            }
+            resp.set_cookie(
+                app.config['SESSION_COOKIE'],
+                session_id,
+                httponly=True,
+                **cookie_options,
+            )
+            resp.set_cookie(
+                app.config['CSRF_COOKIE'],
+                csrf_token,
+                httponly=False,
+                **cookie_options,
+            )
             app.logger.info('Successfully logged in.')
             return resp
-        except (RequestException, HTTPError) as err:
+        except (RequestException, HTTPError, KeyError, ValueError,
+                jwt.InvalidTokenError) as err:
             app.logger.error('Error logging in: %s', str(err))
         return redirect(url_for('login',
                                 msg='Login Failed',
@@ -505,7 +615,7 @@ def create_app():
         redirect_uri = request.args.get('redirect_uri')
         state = request.args.get('state')
         app_name = request.args.get('app_name')
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         consented = request.cookies.get(app.config['CONSENT_COOKIE'])
         if verify_token(token):
             if consented == "true":
@@ -523,7 +633,8 @@ def create_app():
                                    pod_name=pod_name,
                                    pod_zone=pod_zone,
                                    redirect_uri=redirect_uri,
-                                   state=state)
+                                   state=state,
+                                   csrf_token=_csrf_token())
 
         return make_response(redirect(url_for('login',
                                               response_type="code",
@@ -541,14 +652,16 @@ def create_app():
         consent = request.args['consent']
         state = request.args['state']
         redirect_uri = request.args['redirect_uri']
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
 
         app.logger.debug('Checking consent. consent: %s', consent)
 
         if consent == "true":
             app.logger.info('User consent granted.')
             resp = _auth_callback_helper(state, redirect_uri, token)
-            resp.set_cookie(app.config['CONSENT_COOKIE'], 'true')
+            resp.set_cookie(app.config['CONSENT_COOKIE'], 'true',
+                            secure=app.config['COOKIE_SECURE'],
+                            httponly=True, samesite='Strict', path='/')
         else:
             app.logger.info('User consent denied.')
             resp = make_response(redirect(redirect_uri + '#error=access_denied', 302))
@@ -577,7 +690,7 @@ def create_app():
         """
         Renders signup page. Redirects to /login if token is not valid
         """
-        token = request.cookies.get(app.config['TOKEN_NAME'])
+        token = _access_token()
         if verify_token(token):
             # already authenticated
             app.logger.debug('User already authenticated. Redirecting to /home')
@@ -625,14 +738,22 @@ def create_app():
         Logs out user by deleting token cookie and redirecting to login page
         """
         app.logger.info('Logging out.')
-        # Revoke the server-side session first so the token cannot be reused
-        # (e.g. if it was copied) even before its natural expiry.
-        _revoke_session(request.cookies.get(app.config['TOKEN_NAME']))
+        session_id = request.cookies.get(app.config['SESSION_COOKIE'])
+        authentication = _load_authentication()
+        username = authentication[0].get('user') if authentication else None
+        session_store.revoke(session_id, username)
         resp = make_response(redirect(url_for('login_page',
                                               _external=True,
                                               _scheme=app.config['SCHEME'])))
-        resp.delete_cookie(app.config['TOKEN_NAME'])
-        resp.delete_cookie(app.config['CONSENT_COOKIE'])
+        resp.delete_cookie(app.config['SESSION_COOKIE'], path='/',
+                           secure=app.config['COOKIE_SECURE'], httponly=True,
+                           samesite='Strict')
+        resp.delete_cookie(app.config['CSRF_COOKIE'], path='/',
+                           secure=app.config['COOKIE_SECURE'], httponly=False,
+                           samesite='Strict')
+        resp.delete_cookie(app.config['CONSENT_COOKIE'], path='/',
+                           secure=app.config['COOKIE_SECURE'], httponly=True,
+                           samesite='Strict')
         return resp
 
     def decode_token(token):
@@ -641,72 +762,8 @@ def create_app():
                           options={"verify_signature": False})
 
     def verify_token(token):
-        """
-        Validates token using userservice public key
-        """
-        app.logger.debug('Verifying token.')
-        if token is None:
-            return False
-        try:
-            jwt.decode(algorithms='RS256',
-                       jwt=token,
-                       key=app.config['PUBLIC_KEY'],
-                       options={"verify_signature": True})
-            app.logger.debug('Token verified.')
-            if not _session_active(token):
-                app.logger.info('Token rejected: session revoked or expired.')
-                return False
-            return True
-        except jwt.exceptions.InvalidTokenError as err:
-            app.logger.error('Error validating token: %s', str(err))
-            return False
-
-    def _session_key(jti):
-        return 'session:{}'.format(jti)
-
-    def _register_session(token, ttl):
-        """Record this token's session in Redis so it can be revoked."""
-        if redis_client is None:
-            return
-        try:
-            jti = decode_token(token).get('jti')
-            if jti:
-                redis_client.setex(_session_key(jti), ttl, '1')
-        except RedisError as err:
-            app.logger.warning('Unable to register session in Redis: %s', str(err))
-
-    def _revoke_session(token):
-        """Delete this token's session from Redis for an immediate logout."""
-        if redis_client is None or token is None:
-            return
-        try:
-            jti = decode_token(token).get('jti')
-            if jti:
-                redis_client.delete(_session_key(jti))
-        except (RedisError, jwt.exceptions.InvalidTokenError) as err:
-            app.logger.warning('Unable to revoke session in Redis: %s', str(err))
-
-    def _session_active(token):
-        """Return whether the token's session is still valid.
-
-        Fails open: when Redis is not configured or is unavailable we fall
-        back to signature-only verification rather than locking users out.
-        Tokens issued before session tracking (no jti) are also allowed.
-        """
-        if redis_client is None:
-            return True
-        try:
-            jti = decode_token(token).get('jti')
-        except jwt.exceptions.InvalidTokenError:
-            return True
-        if not jti:
-            return True
-        try:
-            return redis_client.exists(_session_key(jti)) == 1
-        except RedisError as err:
-            app.logger.warning('Redis unavailable during session check: %s',
-                               str(err))
-            return True
+        """The access token is returned only after session and JWT validation."""
+        return token is not None
 
     # register html template formatters
     def format_timestamp_day(timestamp):
@@ -741,14 +798,23 @@ def create_app():
         os.environ.get('HISTORY_API_ADDR'))
     app.config["LOGIN_URI"] = 'http://{}/login'.format(
         os.environ.get('USERSERVICE_API_ADDR'))
+    app.config["REFRESH_URI"] = 'http://{}/token/refresh'.format(
+        os.environ.get('USERSERVICE_API_ADDR'))
     app.config["CONTACTS_URI"] = 'http://{}/contacts'.format(
         os.environ.get('CONTACTS_API_ADDR'))
     app.config['PUBLIC_KEY'] = open(os.environ.get('PUB_KEY_PATH'), 'r').read()
     app.config['LOCAL_ROUTING'] = os.getenv('LOCAL_ROUTING_NUM')
     # timeout in seconds for calls to the backend
     app.config['BACKEND_TIMEOUT'] = int(os.getenv('BACKEND_TIMEOUT', '4'))
-    app.config['TOKEN_NAME'] = 'token'
+    app.config['SESSION_COOKIE'] = '__Host-boa_session'
+    app.config['CSRF_COOKIE'] = 'boa_csrf'
     app.config['CONSENT_COOKIE'] = 'consented'
+    app.config['SESSION_ABSOLUTE_TTL_SECONDS'] = int(
+        os.getenv('SESSION_ABSOLUTE_TTL_SECONDS', '3600'))
+    app.config['TOKEN_REFRESH_WINDOW_SECONDS'] = int(
+        os.getenv('TOKEN_REFRESH_WINDOW_SECONDS', '30'))
+    app.config['COOKIE_SECURE'] = os.getenv(
+        'COOKIE_SECURE', 'true').lower() == 'true'
     app.config['TIMESTAMP_FORMAT'] = '%Y-%m-%dT%H:%M:%S.%f%z'
     app.config['SCHEME'] = os.environ.get('SCHEME', 'http')
 

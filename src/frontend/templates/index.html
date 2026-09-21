@@ -211,6 +211,7 @@ limitations under the License.
         <div class="modal-dialog modal-dialog-centered" role="document">
           <div class="modal-content">
             <form id="deposit-form" class="needs-validation" novalidate="" method="POST" action="/deposit">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <div class="modal-header">
                 <h3 class="modal-title header-title" id="exampleModalLongTitle">Make a Deposit</h3>
                 <button type="button" class="close deposit-cancel" data-dismiss="modal" aria-label="Close">
@@ -300,6 +301,7 @@ limitations under the License.
         <div class="modal-dialog modal-dialog-centered" role="document">
           <div class="modal-content">
             <form id="payment-form" class="needs-validation" novalidate="" method="POST" action="/payment">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <div class="modal-header">
                 <h3 class="modal-title header-title" id="exampleModalLongTitle">Send a Payment</h3>
                 <button type="button" class="close payment-cancel" data-dismiss="modal" aria-label="Close">
