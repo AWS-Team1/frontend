@@ -19,14 +19,16 @@ env:
   AWS_REGION: ap-northeast-2
   ECR_REGISTRY: 769413326616.dkr.ecr.ap-northeast-2.amazonaws.com
 
-  # GCP Artifact Registry
+  # GCP Artifact Registryㅁ
   GAR_REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev
   GAR_REPOSITORY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_AR_REPOSITORY }}
 
   # GitOps
   GITOPS_REPOSITORY: AWS-TEAM1/gitops
   GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH || 'dev' }}
-  GITOPS_GROUP_DIR: 03_manifests/eks/frontend
+  
+  EKS_GITOPS_GROUP_DIR: 03_manifests/eks/frontend
+  GKE_GITOPS_GROUP_DIR: 03_manifests/gke/frontend
 
 jobs:
   # ============================================================
@@ -1206,11 +1208,20 @@ jobs:
           echo "  GAR     = $gar_target"
 
   # ============================================================
-  # 6. Update AWS GitOps image references
+  # 6. Update GitOps image references
   #
-  # Important:
-  # GitOps remains pointed to ECR for the AWS environment.
-  # GAR replication is separate from the AWS deployment manifest.
+  # Update all deployment references with the same immutable SHA:
+  #
+  # EKS GitOps
+  #   -> ECR image
+  #
+  # GKE GitOps
+  #   -> GAR image
+  #
+  # Manual EKS manifest
+  #   -> ECR image
+  #
+  # All changed files are committed together in one GitOps commit.
   # ============================================================
   update-gitops:
     name: Update GitOps image references
@@ -1243,6 +1254,9 @@ jobs:
       contents: read
 
     steps:
+      # --------------------------------------------------------
+      # Checkout GitOps repository
+      # --------------------------------------------------------
       - name: Check out GitOps repository
         uses: actions/checkout@v6
         with:
@@ -1252,13 +1266,36 @@ jobs:
           path: gitops
           fetch-depth: 0
 
-      - name: Update only the mapped container images
+      # --------------------------------------------------------
+      # Update:
+      #
+      # 1. EKS manifest
+      #    03_manifests/eks/frontend/frontend.yaml
+      #    -> ECR
+      #
+      # 2. GKE manifest
+      #    03_manifests/gke/frontend/frontend.yaml
+      #    -> GAR
+      #
+      # 3. Manual EKS manifest
+      #    manual/eks/frontend.yaml
+      #    -> ECR
+      # --------------------------------------------------------
+      - name: Update GitOps and manual image references
         working-directory: gitops
 
         env:
           SERVICES_JSON: ${{ needs.detect.outputs.services }}
           IMAGE_TAG: sha-${{ github.sha }}
-          GROUP_DIR: ${{ env.GITOPS_GROUP_DIR }}
+
+          EKS_GROUP_DIR: ${{ env.EKS_GITOPS_GROUP_DIR }}
+          GKE_GROUP_DIR: ${{ env.GKE_GITOPS_GROUP_DIR }}
+
+          MANUAL_EKS_FILE: manual/eks/frontend.yaml
+
+          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
+          GAR_REPOSITORY: ${{ env.GAR_REPOSITORY }}
+
           CHANGED_LIST: ${{ runner.temp }}/gitops-changed-files.txt
 
         shell: bash
@@ -1273,28 +1310,50 @@ jobs:
           import subprocess
           from pathlib import Path
 
-          registry = "769413326616.dkr.ecr.ap-northeast-2.amazonaws.com"
 
-          allowed = {
-              "frontend",
-          }
-
+          # ----------------------------------------------------
+          # Input
+          # ----------------------------------------------------
           services = json.loads(
               os.environ["SERVICES_JSON"]
           )
 
           tag = os.environ["IMAGE_TAG"]
 
-          group_dir = Path(
-              os.environ["GROUP_DIR"]
+          ecr_registry = os.environ["ECR_REGISTRY"]
+          gar_repository = os.environ["GAR_REPOSITORY"]
+
+          eks_group_dir = Path(
+              os.environ["EKS_GROUP_DIR"]
+          )
+
+          gke_group_dir = Path(
+              os.environ["GKE_GROUP_DIR"]
+          )
+
+          manual_eks_file = Path(
+              os.environ["MANUAL_EKS_FILE"]
           )
 
           changed_list = Path(
               os.environ["CHANGED_LIST"]
           )
 
+
+          # ----------------------------------------------------
+          # Allowed services for this repository
+          # ----------------------------------------------------
+          allowed = {
+              "frontend",
+          }
+
+
+          # ----------------------------------------------------
+          # Validate service list
+          # ----------------------------------------------------
           if (
-              services != sorted(set(services))
+              not isinstance(services, list)
+              or services != sorted(set(services))
               or not services
               or any(
                   service not in allowed
@@ -1305,6 +1364,13 @@ jobs:
                   f"invalid canonical service list: {services}"
               )
 
+
+          # ----------------------------------------------------
+          # Validate immutable image tag
+          #
+          # Expected:
+          # sha-<40 lowercase hex chars>
+          # ----------------------------------------------------
           if not re.fullmatch(
               r"sha-[0-9a-f]{40}",
               tag,
@@ -1313,19 +1379,30 @@ jobs:
                   f"invalid immutable tag: {tag}"
               )
 
+
+          # ----------------------------------------------------
+          # Track files actually changed by this job.
+          #
+          # Later we compare this against git diff so that
+          # unexpected files cannot accidentally be committed.
+          # ----------------------------------------------------
           expected_changed: list[str] = []
 
-          for service in services:
-              path = group_dir / f"{service}.yaml"
+
+          # ----------------------------------------------------
+          # Helper:
+          # Update exactly one mapped container image.
+          # ----------------------------------------------------
+          def update_image(
+              path: Path,
+              service: str,
+              image: str,
+          ) -> None:
 
               if not path.is_file():
                   raise SystemExit(
-                      f"mapped GitOps manifest not found: {path}"
+                      f"mapped manifest not found: {path}"
                   )
-
-              image = (
-                  f"{registry}/boa-{service}:{tag}"
-              )
 
               content = path.read_text(
                   encoding="utf-8"
@@ -1350,8 +1427,8 @@ jobs:
               if count != 1:
                   raise SystemExit(
                       "expected exactly one mapped "
-                      f"container for {service}, "
-                      f"found {count}"
+                      f"container for {service} "
+                      f"in {path}, found {count}"
                   )
 
               if updated != content:
@@ -1364,16 +1441,98 @@ jobs:
                       path.as_posix()
                   )
 
+                  print(
+                      f"Updated {path} -> {image}"
+                  )
+
+              else:
+                  print(
+                      f"Already current {path} -> {image}"
+                  )
+
+
+          # ----------------------------------------------------
+          # Update each affected service.
+          #
+          # "targets" means files that need the same SHA.
+          # This is NOT a deployment sequence.
+          #
+          # All files are changed locally first, then committed
+          # together later in one Git commit.
+          # ----------------------------------------------------
+          for service in services:
+
+              ecr_image = (
+                  f"{ecr_registry}/"
+                  f"boa-{service}:{tag}"
+              )
+
+              gar_image = (
+                  f"{gar_repository}/"
+                  f"boa-{service}:{tag}"
+              )
+
+              targets = [
+                  # Argo CD / EKS
+                  (
+                      eks_group_dir / f"{service}.yaml",
+                      ecr_image,
+                  ),
+
+                  # Argo CD / GKE
+                  (
+                      gke_group_dir / f"{service}.yaml",
+                      gar_image,
+                  ),
+              ]
+
+
+              # ------------------------------------------------
+              # Manual EKS manifest
+              #
+              # Frontend repository currently manages only
+              # frontend, so manual/eks/frontend.yaml is updated
+              # with the same canonical ECR image.
+              # ------------------------------------------------
+              if service == "frontend":
+                  targets.append(
+                      (
+                          manual_eks_file,
+                          ecr_image,
+                      )
+                  )
+
+
+              # ------------------------------------------------
+              # Apply the same image-update logic to every
+              # required GitOps/manual target.
+              # ------------------------------------------------
+              for path, image in targets:
+                  update_image(
+                      path=path,
+                      service=service,
+                      image=image,
+                  )
+
+
+          # ----------------------------------------------------
+          # Validate that this job modified only expected files.
+          # ----------------------------------------------------
           actual_changed = sorted(
               line
               for line in subprocess.check_output(
-                  ["git", "diff", "--name-only"],
+                  [
+                      "git",
+                      "diff",
+                      "--name-only",
+                  ],
                   text=True,
               ).splitlines()
               if line
           )
 
           expected_changed.sort()
+
 
           if actual_changed != expected_changed:
               raise SystemExit(
@@ -1382,6 +1541,10 @@ jobs:
                   f"actual={actual_changed}"
               )
 
+
+          # ----------------------------------------------------
+          # Save changed file list for the commit step.
+          # ----------------------------------------------------
           changed_list.write_text(
               "".join(
                   f"{path}\n"
@@ -1389,10 +1552,25 @@ jobs:
               ),
               encoding="utf-8",
           )
+
+
+          print(
+              "GitOps image reference update completed."
+          )
+
+          for path in expected_changed:
+              print(
+                  f"Changed: {path}"
+              )
+
           PY
 
           git diff --check
 
+
+      # --------------------------------------------------------
+      # Commit all GitOps/manual changes together
+      # --------------------------------------------------------
       - name: Commit and push GitOps update
         working-directory: gitops
 
@@ -1405,10 +1583,10 @@ jobs:
           set -Eeuo pipefail
 
           if [ ! -s "$CHANGED_LIST" ]; then
-
-            echo "GitOps references already point to sha-${{ github.sha }}."
+            echo "All GitOps references already point to sha-${{ github.sha }}."
             exit 0
           fi
+
 
           git config \
             user.name \
@@ -1418,12 +1596,15 @@ jobs:
             user.email \
             "aws-team1-cicd@users.noreply.github.com"
 
+
           while IFS= read -r path; do
             git add -- "$path"
           done < "$CHANGED_LIST"
 
+
           git commit \
             -m "deploy(frontend): sha-${{ github.sha }}"
+
 
           for attempt in 1 2 3 4 5; do
 
@@ -1434,14 +1615,17 @@ jobs:
               exit 0
             fi
 
+
             if [ "$attempt" -eq 5 ]; then
               echo "::error::GitOps push failed after 5 attempts"
               exit 1
             fi
 
+
             git fetch \
               origin \
               "+refs/heads/${GITOPS_BRANCH}:refs/remotes/origin/${GITOPS_BRANCH}"
+
 
             if ! git rebase \
               "origin/${GITOPS_BRANCH}"; then
