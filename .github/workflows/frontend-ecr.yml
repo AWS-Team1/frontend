@@ -15,6 +15,8 @@ concurrency:
 permissions: {}
 
 env:
+  # ci_detect.py treats a shared workflow change as affecting the service.
+  # This also allows its immutable image to be restored after registry recreation.
   # AWS
   AWS_REGION: ap-northeast-2
   ECR_REGISTRY: 769413326616.dkr.ecr.ap-northeast-2.amazonaws.com
