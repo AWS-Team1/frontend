@@ -1245,8 +1245,7 @@ jobs:
         needs.plan-images.result == 'success' &&
         needs.build.result == 'success' &&
         needs.push.result == 'success' &&
-        needs.detect.outputs.services != '[]' &&
-      (vars.DEPLOY_ENGINE == '' || vars.DEPLOY_ENGINE == 'argocd')
+        needs.detect.outputs.services != '[]'
       }}
 
     runs-on: ubuntu-latest
