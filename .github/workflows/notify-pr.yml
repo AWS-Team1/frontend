@@ -49,7 +49,7 @@ jobs:
                   type: "section",
                   text: {
                     type: "mrkdwn",
-                    text: "<!here> *Frontend 담당자분들은 PR을 확인해 주세요.*"
+                    text: "<@U0BF5AZ153M> *Frontend PR을 확인해 주세요.*"
                   }
                 },
                 {
