@@ -2033,3 +2033,68 @@ jobs:
               f"{results}"
           )
           PY
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PIPELINE_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          jq -n \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg commit "${GITHUB_SHA::7}" \
+            --arg status "$PIPELINE_STATUS" \
+            --arg url "$RUN_URL" \
+            --arg reviewer "<@U0BF5AZ153M>" \
+            '($status == "success") as $ok |
+            {
+              text: ("Frontend CI/CD " + (if $ok then "성공" else "실패" end)),
+              blocks: [
+                {
+                  type: "header",
+                  text: {
+                    type: "plain_text",
+                    text: ((if $ok then "✅" else "❌" end) + " Frontend CI/CD " + (if $ok then "성공" else "실패" end)),
+                    emoji: true
+                  }
+                },
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: (if $ok then
+                      "이미지 배포 및 GitOps 업데이트가 완료됐습니다."
+                    else
+                      ($reviewer + " *파이프라인 실패를 확인해 주세요.*")
+                    end)
+                  }
+                },
+                {
+                  type: "section",
+                  fields: [
+                    {type: "mrkdwn", text: ("*브랜치*\n`" + $branch + "`")},
+                    {type: "mrkdwn", text: ("*커밋*\n`" + $commit + "`")},
+                    {type: "mrkdwn", text: ("*실행자*\n" + $actor)},
+                    {type: "mrkdwn", text: ("*상태*\n`" + $status + "`")}
+                  ]
+                },
+                {
+                  type: "actions",
+                  elements: [
+                    {
+                      type: "button",
+                      text: {type: "plain_text", text: "Actions 확인하기", emoji: true},
+                      style: (if $ok then "primary" else "danger" end),
+                      url: $url
+                    }
+                  ]
+                }
+              ]
+            }' |
+            curl --fail-with-body --retry 2 \
+              --header 'Content-Type: application/json' \
+              --data @- \
+              "$SLACK_WEBHOOK_URL"
