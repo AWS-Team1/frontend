@@ -2051,13 +2051,13 @@ jobs:
             --arg reviewer "<@U0BF5AZ153M>" \
             '($status == "success") as $ok |
             {
-              text: ("Frontend CI/CD " + (if $ok then "성공" else "실패" end)),
+              text: ("Frontend 빌드/GitOps 반영 " + (if $ok then "성공" else "실패" end)),
               blocks: [
                 {
                   type: "header",
                   text: {
                     type: "plain_text",
-                    text: ((if $ok then "✅" else "❌" end) + " Frontend CI/CD " + (if $ok then "성공" else "실패" end)),
+                    text: ((if $ok then "✅" else "❌" end) + " Frontend 빌드/GitOps 반영 " + (if $ok then "성공" else "실패" end)),
                     emoji: true
                   }
                 },
@@ -2066,9 +2066,9 @@ jobs:
                   text: {
                     type: "mrkdwn",
                     text: (if $ok then
-                      "이미지 배포 및 GitOps 업데이트가 완료됐습니다."
+                      "이미지 push와 GitOps 태그 업데이트가 완료됐습니다. Argo CD 배포 완료를 기다립니다."
                     else
-                      ($reviewer + " *파이프라인 실패를 확인해 주세요.*")
+                      ($reviewer + " *빌드/GitOps 파이프라인 실패를 확인해 주세요.*")
                     end)
                   }
                 },
