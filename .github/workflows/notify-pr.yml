@@ -15,14 +15,85 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           PR_ACTION: ${{ github.event.action }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         shell: bash
         run: |
           jq -n \
-            --arg text ":bell: PR #${PR_NUMBER} ${PR_ACTION} by ${PR_AUTHOR}\n${PR_TITLE}\n${PR_URL}" \
-            '{text: $text}' |
+            --arg action "$PR_ACTION" \
+            --arg author "$PR_AUTHOR" \
+            --arg base "$PR_BASE" \
+            --arg head "$PR_HEAD" \
+            --arg number "$PR_NUMBER" \
+            --arg title "$PR_TITLE" \
+            --arg url "$PR_URL" \
+            'def slack_escape:
+              gsub("&"; "&amp;") |
+              gsub("<"; "&lt;") |
+              gsub(">"; "&gt;");
+            {
+              text: ("Frontend PR #" + $number + ": " + ($title | slack_escape)),
+              blocks: [
+                {
+                  type: "header",
+                  text: {
+                    type: "plain_text",
+                    text: "🔔 Frontend PR 리뷰 요청",
+                    emoji: true
+                  }
+                },
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: "<!here> *Frontend 담당자분들은 PR을 확인해 주세요.*"
+                  }
+                },
+                {
+                  type: "section",
+                  fields: [
+                    {type: "mrkdwn", text: ("*PR*\n#" + $number)},
+                    {type: "mrkdwn", text: ("*작성자*\n" + ($author | slack_escape))},
+                    {type: "mrkdwn", text: ("*브랜치*\n`" + ($head | slack_escape) + "`")},
+                    {type: "mrkdwn", text: ("*대상*\n`" + ($base | slack_escape) + "`")}
+                  ]
+                },
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: ("*제목*\n" + ($title | slack_escape))
+                  }
+                },
+                {
+                  type: "actions",
+                  elements: [
+                    {
+                      type: "button",
+                      text: {
+                        type: "plain_text",
+                        text: "PR 확인하기",
+                        emoji: true
+                      },
+                      style: "primary",
+                      url: $url
+                    }
+                  ]
+                },
+                {
+                  type: "context",
+                  elements: [
+                    {
+                      type: "mrkdwn",
+                      text: ("이벤트: `" + $action + "` · AWS-Team1/frontend")
+                    }
+                  ]
+                }
+              ]
+            }' |
             curl --fail-with-body --retry 2 \
               --header 'Content-Type: application/json' \
               --data @- \
