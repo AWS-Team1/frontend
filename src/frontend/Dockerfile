@@ -15,7 +15,7 @@
 # Use the official Python docker container, slim version, running Debian.
 # Pin Python 3.14.7 to Debian 12 (bookworm) for a reproducible runtime base.
 # Refresh the digest only after the replacement image passes the same Trivy gate.
-FROM python:3.14.7-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS base
+FROM python:3.14.8-slim-bookworm@sha256:c8137f4c460908c8763f281c8f22c431eb5c538514ba9553fc3a89c06b7cfb88 AS base
 # uv pinned to an explicit version + digest (was the mutable ':latest' tag) so the
 # builder toolchain is reproducible and not silently updated on every CI run.
 COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 /uv /bin/uv
